@@ -27,6 +27,7 @@ import ctypes
 from contextlib import AbstractContextManager
 import os
 import time
+import uuid
 
 DELAY, MULTIPLIER, MAX_DELAY = 2, 1.5, 120
 DCGM_4_PYTHON_PATH = "/usr/share/datacenter-gpu-manager-4/bindings/python3"
@@ -1157,7 +1158,11 @@ class DCGMWatcher:
                 )
 
             if watched_fields:
-                self._field_group = pydcgm.DcgmFieldGroup(dcgm_handle, "nvsentinel_field_monitors", watched_fields)
+                # Field-group names must be unique across all clients of the hostengine, and
+                # the hostengine keeps a field group until it sees the owning connection close.
+                # A fixed name collides with the group of a stale connection.
+                field_group_name = f"nvsentinel_field_monitors_{uuid.uuid4().hex}"
+                self._field_group = pydcgm.DcgmFieldGroup(dcgm_handle, field_group_name, watched_fields)
                 update_freq_usec = self._poll_interval_seconds * 1_000_000
                 # Field monitors need only the newest sample. Other clients may
                 # retain more history; the thermal reader discards older samples.
@@ -1283,6 +1288,7 @@ class DCGMWatcher:
                                 )
                         except Exception as e:
                             log.error(f"Error getting DCGM handle: {e}")
+                            metrics.dcgm_api_failures.labels("dcgm_initialize_monitoring").inc()
                             self._report_connectivity_failed()
                             self._cleanup_dcgm_resources(dcgm_group, dcgm_handle)
                             dcgm_handle = None

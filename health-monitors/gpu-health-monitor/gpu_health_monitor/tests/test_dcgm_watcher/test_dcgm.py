@@ -1799,6 +1799,128 @@ class TestDCGMHealthChecks:
         group.health.Set.assert_called_once()
 
 
+class _DcgmDuplicateKeyError(Exception):
+    """Stands in for the DCGMError that DCGM raises for DCGM_ST_DUPLICATE_KEY (-26)."""
+
+
+class _FakeHostengineFieldGroups:
+    """Field-group table of one fake hostengine.
+
+    Like DcgmFieldGroupManager::AddFieldGroup, a field-group name must be unique
+    across all client connections. A field group stays until a client deletes it
+    or the hostengine sees the owning connection close.
+    """
+
+    def __init__(self) -> None:
+        """Start with no field groups on the hostengine."""
+        self.live_names: set[str] = set()
+        self.created_names: list[str] = []
+
+    def field_group_class(self) -> type:
+        """Return a stand-in for pydcgm.DcgmFieldGroup that uses this table."""
+        table = self
+
+        class FakeDcgmFieldGroup:
+            """Stands in for pydcgm.DcgmFieldGroup."""
+
+            def __init__(self, dcgm_handle: object, name: str = "", fieldIds: list[int] | None = None) -> None:
+                """Add the field group, or raise if a field group with this name exists."""
+                if name in table.live_names:
+                    raise _DcgmDuplicateKeyError("Duplicate key passed to function")
+                table.live_names.add(name)
+                table.created_names.append(name)
+                self.name = name
+                self.fieldGroupId = len(table.created_names)
+
+            def Delete(self) -> None:
+                """Remove the field group from the hostengine."""
+                table.live_names.discard(self.name)
+
+        return FakeDcgmFieldGroup
+
+
+class TestFieldGroupAfterStaleConnection:
+    """Tests for DCGM field-group setup after a stale connection.
+
+    The hostengine does not see an unclean client disconnect, so the field group
+    of the stale connection stays. A new connection must still set up its field
+    watches.
+    """
+
+    @pytest.fixture
+    def hostengine(self, monkeypatch: pytest.MonkeyPatch) -> _FakeHostengineFieldGroups:
+        """Replace pydcgm.DcgmFieldGroup with a fake that applies the unique-name rule."""
+        table = _FakeHostengineFieldGroups()
+        monkeypatch.setattr(dcgm.pydcgm, "DcgmFieldGroup", table.field_group_class(), raising=False)
+        return table
+
+    @staticmethod
+    def _make_watcher() -> dcgm.DCGMWatcher:
+        """Return a watcher with thermal margin enabled and entity discovery mocked."""
+        watcher = dcgm.DCGMWatcher(
+            dcgm.types.DCGMWatcherConfig(
+                addr="localhost:5555",
+                poll_interval_seconds=10,
+                dcgm_k8s_service_enabled=False,
+                thermal_margin_enabled=True,
+            ),
+            callbacks=[],
+            metadata_reader=MagicMock(),
+        )
+        watcher._create_dcgm_group_with_all_entities = MagicMock(side_effect=lambda handle: (MagicMock(), []))
+        watcher._get_gpu_serial_numbers = MagicMock(return_value={})
+        return watcher
+
+    @pytest.mark.parametrize("restart_monitor", [False, True], ids=["reconnect_in_process", "monitor_restart"])
+    def test_initialize_dcgm_monitoring_after_unclean_disconnect_succeeds(
+        self, hostengine: _FakeHostengineFieldGroups, restart_monitor: bool
+    ) -> None:
+        """A new connection sets up its field watches while a stale field group stays."""
+        stale_watcher = self._make_watcher()
+        stale_watcher._initialize_dcgm_monitoring(MagicMock())
+        # Unclean disconnect: no cleanup reaches the hostengine, so the field
+        # group of the stale connection stays.
+
+        watcher = self._make_watcher() if restart_monitor else stale_watcher
+        watcher._initialize_dcgm_monitoring(MagicMock())
+
+        assert len(hostengine.live_names) == 2
+        assert all(name.startswith("nvsentinel_field_monitors") for name in hostengine.created_names)
+
+    def test_clean_reconnect_leaves_one_field_group(self, hostengine: _FakeHostengineFieldGroups) -> None:
+        """After a clean cleanup and a new connection, only the new field group stays."""
+        watcher = self._make_watcher()
+        dcgm_group, _, _, _ = watcher._initialize_dcgm_monitoring(MagicMock())
+        watcher._cleanup_dcgm_resources(dcgm_group, MagicMock())
+
+        watcher._initialize_dcgm_monitoring(MagicMock())
+
+        assert len(hostengine.created_names) == 2
+        assert hostengine.live_names == {hostengine.created_names[-1]}
+
+    @pytest.mark.parametrize("setup_fails", [True, False], ids=["setup_fails", "setup_succeeds"])
+    def test_monitoring_setup_failure_increments_counter(self, setup_fails: bool) -> None:
+        """Only a failed DCGM monitoring setup increments the dcgm_initialize_monitoring counter."""
+        watcher = self._make_watcher()
+        watcher._get_dcgm_handle = MagicMock(return_value=MagicMock())
+        if setup_fails:
+            setup_error = _DcgmDuplicateKeyError("Duplicate key passed to function")
+            watcher._initialize_dcgm_monitoring = MagicMock(side_effect=setup_error)
+        else:
+            watcher._initialize_dcgm_monitoring = MagicMock(return_value=(MagicMock(), [], [], {}))
+        counter = dcgm.metrics.dcgm_api_failures.labels("dcgm_initialize_monitoring")
+        before = counter._value.get()
+
+        # Run one loop cycle: stop after the first monitoring setup.
+        stop_event = MagicMock(spec=Event)
+        stop_event.wait.return_value = False
+        stop_event.is_set.side_effect = lambda: watcher._initialize_dcgm_monitoring.called
+        watcher.start([], stop_event)
+
+        watcher._initialize_dcgm_monitoring.assert_called_once()
+        assert counter._value.get() - before == (1 if setup_fails else 0)
+
+
 class TestDCGMHandleLeakFix:
     """Tests for the DCGM handle/connection leak fix (issue #1078).
 
